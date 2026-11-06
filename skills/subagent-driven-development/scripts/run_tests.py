@@ -11,7 +11,7 @@ test becomes a `test-failure` incident; on a --full run each test file whose
 tests all pass becomes a `verified` incident (once per distinct entry). With `--task Tn` each
 `test-failure` incident carries `task`, and a later run closes that task's open ones whose test
 now passes (`resolution` `fixed`, as `sl incident resolve` writes it); a pytest run that produces
-no results logs one `no-result` incident. Appends
+no results logs one `no-result` incident (so does a non-Python run that prints no test count: `no tests ran:`). A `--fast` path that does not exist (node suffix `::` ignored) is a usage error: exit 2, `test path not found`, no incident. Appends
 a `tests` line to the progress ledger. On every run it also writes
 `.superlite/test-summary.json` (--summary), the file `pt_review packet` reads:
 `{"passed": N, "failed": N, "skipped": N, "seconds": S, "mode": "fast|full",
@@ -29,6 +29,9 @@ prints it, and exits 0 green, 1 red, 2 on timeout or when no background run was 
 --wait PATH waits on exactly that run's summary (the `summary:` line; --background also prints
 `wait: <abs>/sl run_tests --wait <path>` with the absolute path of the sl launcher, copy it verbatim); bare --wait uses the shared pointer.
 Put --wait last or before another flag: argparse takes a following word as its PATH.
+A green --full run (not --task, not --fast, not --record) in a git toplevel holding `scripts/test_layers.py` also stamps the
+unit layer green (`run_tests: unit layer stamped`), from digests taken before the run, so a file changed during it stays stale; a stamp
+error prints `run_tests: unit layer not stamped: <err>` and never changes the exit code. `--record` never stamps.
 Stdlib only.
 """
 # Complexity notation:
@@ -36,6 +39,7 @@ Stdlib only.
 #   sk = skipped tests, I = lines in the incident log (B = its bytes), d = depth of a dotted classname,
 #   p = pytest path args, O = bytes of pytest output, c = length of an incident context, w = width of one line
 import argparse  # O(1)
+import importlib.util  # O(1)
 import json  # O(1)
 import os  # O(1)
 import re  # O(1)
@@ -367,6 +371,52 @@ def resolve_passed(log, task, failures, files):  # O(B + I + k) read the log onc
     add_incidents(log, items, task)  # O(total c) one append
 
 
+def missing_fast_paths(paths):  # O(p) the --fast paths that do not exist (a `::node` suffix is dropped)
+    return [p for p in paths if not Path(p.split("::", 1)[0]).exists()]  # O(p)
+
+
+def missing_line(paths, cwd, root):  # O(p) the usage-error text for missing --fast paths, else None
+    gone = missing_fast_paths(paths)  # O(p)
+    if not gone:  # O(1)
+        return None  # O(1)
+    return f"test path not found: {', '.join(gone)} (cwd {cwd}, root {root})"  # O(p)
+
+
+def unit_snapshot(a, label):  # the unit layer's digests before a full run, None when it cannot be stamped | O(n * size) n = repo files
+    if label != "full" or a.task:  # O(1)
+        return None  # O(1)
+    try:  # O(1)
+        cwd = Path.cwd().resolve()  # O(1)
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()  # O(1)
+        script = cwd / "scripts" / "test_layers.py"  # O(1)
+        if not top or Path(top).resolve() != cwd or not script.is_file():  # O(1)
+            return None  # O(1)
+        saved = list(sys.path)  # the layer script inserts its own folder; load it without leaving that behind | O(P)
+        try:  # O(1)
+            spec = importlib.util.spec_from_file_location("superlite_test_layers", script)  # O(1)
+            mod = importlib.util.module_from_spec(spec)  # O(1)
+            spec.loader.exec_module(mod)  # O(size)
+        finally:  # O(1)
+            sys.path[:] = saved  # O(P)
+        if "unit" not in mod.LAYERS:  # O(1)
+            return None  # O(1)
+        return (mod, cwd, mod.layer_store.store_path(cwd), mod.layer_digests("unit", cwd))  # O(n * size)
+    except Exception as e:  # O(1)
+        print(f"run_tests: unit layer not stamped: {e}", file=sys.stderr)  # O(1)
+        return None  # O(1)
+
+
+def stamp_unit(snap):  # stamp the unit layer green from a snapshot; an error never changes the exit code | O(n)
+    if snap is None:  # O(1)
+        return  # O(1)
+    try:  # O(1)
+        mod, root, state, digests = snap  # O(1)
+        mod.write_stamp(root, state, "unit", digests)  # O(n)
+        print("run_tests: unit layer stamped", file=sys.stderr)  # O(1)
+    except Exception as e:  # O(1)
+        print(f"run_tests: unit layer not stamped: {e}", file=sys.stderr)  # O(1)
+
+
 def main(argv=None):  # O(X + T*d + B + F log F) + pytest run + one incident append
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])  # O(1)
     mode = ap.add_mutually_exclusive_group()  # O(1)
@@ -396,6 +446,7 @@ def main(argv=None):  # O(X + T*d + B + F log F) + pytest run + one incident app
     a = ap.parse_args(argv)  # O(1)
     a.started = time.time()  # before the runner reads any code: the summary's `started` (#101) | O(1)
     cwd = Path.cwd().resolve()  # O(1)
+    a.cwd = cwd  # for the missing-path message, before to_root moves us | O(1)
     root = project_root(cwd) if a.wait_path is None else None  # --wait paths are absolute | O(d)
     if root is not None and root != cwd:  # O(1)
         to_root(a, argv, cwd, root)  # O(len argv + p)
@@ -404,6 +455,16 @@ def main(argv=None):  # O(X + T*d + B + F log F) + pytest run + one incident app
     if a.wait_path is not None:  # O(1)
         return wait_background(a)  # O(timeout / POLL_SECONDS)
     if a.background:  # O(1)
+        if a.fast:  # a missing path is refused here, not in the detached child | O(1)
+            try:  # O(1)
+                fast = expand_fast_paths([p for chunk in a.fast for p in nt.csv(chunk)])  # O(p)
+                spec = testcmd.resolve(".", fast)  # O(m + f)
+            except FileNotFoundError:  # left to the child | O(1)
+                fast, spec = [], None  # O(1)
+            gone = missing_line(fast, a.cwd, Path.cwd()) if spec and spec["python"] and fast else None  # O(p)
+            if gone:  # O(1)
+                print(f"run_tests: {gone}", file=sys.stderr)  # O(1)
+                return 2  # O(1)
         return start_background(a, argv)  # O(len argv) + spawn
     if a.run_id:  # O(1) detached child: a crash still leaves a (red) summary for --wait
         try:  # O(1)
@@ -493,6 +554,14 @@ def run_other(a, spec, paths, label, cwd=None):  # one runner command (any langu
             tail_set = {x.strip() for x in p["tail"]}  # O(40)
             kept = [x for x in (p["error"] if r.returncode else "", p["marker"]) if x and x not in tail_set]  # the error and marker may sit above the last 40 lines | O(40)
             atomic_write(Path(a.summary).with_name("test-output.log"), "\n".join([*kept, *p["tail"]]) + "\n")  # O(40)
+            if not r.returncode and not (p["passed"] or p["failed"] or p["skipped"] or p["names"]):  # the runner counted zero tests: a stop, not a pass (#240) | O(1)
+                reason = f"no tests ran: exit {r.returncode} from `{spec['command']}` with no test count; its filter may select nothing"[:300]  # O(1)
+                print(f"run_tests: {reason}", file=sys.stderr)  # O(1)
+                write_summary(a.summary, label, {"passed": 0, "failed": 0, "skipped": 0, "skipped_tests": []}, [], seconds, error=reason)  # O(1)
+                publish_summary(a)  # O(summary size)
+                add_incidents(a.log, [("-", 0, reason, "no-result", "open")], a.task)  # O(c)
+                print(f"0 0 0 {seconds:.1f}")  # O(1)
+                return 1  # O(1)
     return finish_run(a, label, counts, failures, files, seconds, r.returncode)  # O(k + F)
 
 
@@ -531,6 +600,7 @@ def run(a):  # O(X + T*d + B + F log F) + the runner + one incident append
             publish_summary(a)  # O(summary size)
             print("0 0 0 0.0")  # O(1)
             return 1  # O(1)
+    a.unit_snap = unit_snapshot(a, label)  # before the runner touches anything | O(n * size)
     spec = testcmd.resolve(".", paths)  # .superlite/test-cmd.json, else marker files | O(m + f)
     if spec is None:  # no test command: exit 2 with a clear summary | O(1)
         hint = getattr(testcmd, "missing_reason", None)  # T3's text when present | O(1)
@@ -541,6 +611,16 @@ def run(a):  # O(X + T*d + B + F log F) + the runner + one incident append
         publish_summary(a)  # O(summary size)
         print("0 0 0 0.0")  # O(1)
         return 2  # O(1)
+    if not spec["python"]:  # a configured `test` command may narrow the suite: it never stamps the unit layer | O(1)
+        a.unit_snap = None  # O(1)
+    if spec["python"] and paths:  # a missing path is a usage error, not a no-result stop (#235) | O(p)
+        gone = missing_line(paths, getattr(a, "cwd", Path.cwd()), Path.cwd())  # O(p)
+        if gone:  # O(1)
+            print(f"run_tests: {gone}", file=sys.stderr)  # O(1)
+            write_summary(a.summary, label, {"passed": 0, "failed": 0, "skipped": 0, "skipped_tests": []}, [], 0.0, error=gone)  # O(1)
+            publish_summary(a)  # O(summary size)
+            print("0 0 0 0.0")  # O(1)
+            return 2  # O(1)
     if not spec["python"]:  # O(1)
         tree = None  # O(1)
         if a.task and spec.get("isolate", False):  # compiled stack: test own files only, in an isolated tree | O(1)
@@ -557,6 +637,7 @@ def run(a):  # O(X + T*d + B + F log F) + the runner + one incident append
             info = nt.parse_plan(plan)  # O(L)
             if a.task not in info:  # O(1)
                 nt.die(f"unknown task {a.task}")  # O(1)
+            ct.add_also_owns(info, a.ledger)  # --also and --claim rulings own their files too (#239) | O(c + o)
             tree = trees.prepare(".", a.task, info[a.task]["owns"])  # O(f * o) + git checkout
         return run_other(a, spec, paths, label, cwd=tree)  # O(X + o)
 
@@ -610,7 +691,10 @@ def finish_run(a, label, counts, failures, files, seconds, returncode):  # O(k +
                      f"failed={counts['failed']} skipped={counts['skipped']} "  # O(1)
                      f"seconds={seconds:.1f}")  # O(1)
     print(summary)  # O(1)
-    return 1 if counts["failed"] or not (counts["passed"] or counts["skipped"]) else 0  # O(1)
+    red = counts["failed"] or not (counts["passed"] or counts["skipped"])  # O(1)
+    if not red:  # O(1)
+        stamp_unit(getattr(a, "unit_snap", None))  # O(n)
+    return 1 if red else 0  # O(1)
 
 
 if __name__ == "__main__":  # O(1)
